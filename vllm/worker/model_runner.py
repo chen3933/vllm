@@ -604,79 +604,107 @@ class ModelRunner:
             slot_mapping=slot_mapping,
         )
 
+    def create_input_tensors(self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+    ) -> Tuple[torch.Tensor, torch.Tensor,
+               torch.Tensor, SamplingMetadata,
+               Set[LoRARequest], LoRAMapping,
+               torch.Tensor, Optional[AttentionMetadataPerStage],
+               Optional[AttentionMetadata], int, int, int]:
+        prefill_reqs = []
+        decode_reqs = []
+        for seq_group_meta in seq_group_metadata_list:
+            if seq_group_meta.is_prompt:
+                prefill_reqs.append(seq_group_meta)
+            else:
+                decode_reqs.append(seq_group_meta)
+
+        # Prepare input tensors.
+        (
+            input_tokens,
+            input_positions,
+            prefill_attn_metadata,
+            seq_lens,
+            query_lens,
+            lora_index_mapping,
+            lora_prompt_mapping,
+            lora_requests,
+            multi_modal_input,
+            slot_mapping,
+        ) = self._prepare_prompt(prefill_reqs)
+        (
+            decode_input_tokens,
+            decode_input_positions,
+            decode_attn_metadata,
+            decode_lora_index_mapping,
+            decode_lora_prompt_mapping,
+            decode_lora_requests,
+            decode_slot_mapping,
+        ) = self._prepare_decode(decode_reqs)
+        sampling_metadata = SamplingMetadata.prepare(
+            seq_group_metadata_list, seq_lens, query_lens, self.device,
+            self.pin_memory)
+
+        if not self.scheduler_config.chunked_prefill_enabled:
+            assert (len(prefill_reqs) and len(decode_reqs)) == 0
+
+        num_prefills = len(seq_lens)
+        num_prefill_tokens = len(input_tokens)
+        num_decode_tokens = len(decode_input_tokens)
+
+        # Coalesce tensors. Note that attn_metadata is currently not
+        # coalesced for simplicity.
+        input_tokens.extend(decode_input_tokens)
+        input_positions.extend(decode_input_positions)
+        slot_mapping.extend(decode_slot_mapping)
+        lora_index_mapping.extend(decode_lora_index_mapping)
+        lora_prompt_mapping.extend(decode_lora_prompt_mapping)
+        lora_requests.update(decode_lora_requests)
+
+        input_tokens = torch.tensor(input_tokens,
+                                    dtype=torch.long,
+                                    device=self.device)
+        input_positions = torch.tensor(input_positions,
+                                        dtype=torch.long,
+                                        device=self.device)
+        slot_mapping = torch.tensor(slot_mapping,
+                                    dtype=torch.long,
+                                    device=self.device)
+
+        if self.lora_config:
+            lora_mapping = LoRAMapping(
+                lora_index_mapping,
+                lora_prompt_mapping,
+            )
+        else:
+            lora_mapping = None
+
+        return (input_tokens, input_positions, slot_mapping,
+                sampling_metadata, lora_requests, lora_mapping,
+                multi_modal_input, prefill_attn_metadata,
+                decode_attn_metadata, num_prefills, num_prefill_tokens,
+                num_decode_tokens)
+
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
                Set[LoRARequest], LoRAMapping, torch.Tensor]:
         if self.is_driver_worker:
-            prefill_reqs = []
-            decode_reqs = []
-            for seq_group_meta in seq_group_metadata_list:
-                if seq_group_meta.is_prompt:
-                    prefill_reqs.append(seq_group_meta)
-                else:
-                    decode_reqs.append(seq_group_meta)
-
-            # Prepare input tensors.
             (
                 input_tokens,
                 input_positions,
-                prefill_attn_metadata,
-                seq_lens,
-                query_lens,
-                lora_index_mapping,
-                lora_prompt_mapping,
-                lora_requests,
-                multi_modal_input,
                 slot_mapping,
-            ) = self._prepare_prompt(prefill_reqs)
-            (
-                decode_input_tokens,
-                decode_input_positions,
+                sampling_metadata,
+                lora_requests,
+                lora_mapping,
+                multi_modal_input,
+                prefill_attn_metadata,
                 decode_attn_metadata,
-                decode_lora_index_mapping,
-                decode_lora_prompt_mapping,
-                decode_lora_requests,
-                decode_slot_mapping,
-            ) = self._prepare_decode(decode_reqs)
-            sampling_metadata = SamplingMetadata.prepare(
-                seq_group_metadata_list, seq_lens, query_lens, self.device,
-                self.pin_memory)
-
-            if not self.scheduler_config.chunked_prefill_enabled:
-                assert (len(prefill_reqs) and len(decode_reqs)) == 0
-
-            num_prefills = len(seq_lens)
-            num_prefill_tokens = len(input_tokens)
-            num_decode_tokens = len(decode_input_tokens)
-
-            # Coalesce tensors. Note that attn_metadata is currently not
-            # coalesced for simplicity.
-            input_tokens.extend(decode_input_tokens)
-            input_positions.extend(decode_input_positions)
-            slot_mapping.extend(decode_slot_mapping)
-            lora_index_mapping.extend(decode_lora_index_mapping)
-            lora_prompt_mapping.extend(decode_lora_prompt_mapping)
-            lora_requests.update(decode_lora_requests)
-
-            input_tokens = torch.tensor(input_tokens,
-                                        dtype=torch.long,
-                                        device=self.device)
-            input_positions = torch.tensor(input_positions,
-                                           dtype=torch.long,
-                                           device=self.device)
-            slot_mapping = torch.tensor(slot_mapping,
-                                        dtype=torch.long,
-                                        device=self.device)
-
-            if self.lora_config:
-                lora_mapping = LoRAMapping(
-                    lora_index_mapping,
-                    lora_prompt_mapping,
-                )
-            else:
-                lora_mapping = None
+                num_prefills,
+                num_prefill_tokens,
+                num_decode_tokens
+            ) = self.create_input_tensors(seq_group_metadata_list=seq_group_metadata_list)
 
             # Broadcast the metadata.
             # If batch contains both prefill and decode, it sends 2 broadcasts.

@@ -15,7 +15,7 @@ from vllm.distributed import (broadcast_tensor_dict,
                               set_custom_all_reduce)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
-from vllm.sequence import ExecuteModelRequest, PoolerOutput, SamplerOutput
+from vllm.sequence import ExecuteModelRequest, PoolerOutput, SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.embedding_model_runner import EmbeddingModelRunner
 from vllm.worker.model_runner import ModelRunner
@@ -208,40 +208,55 @@ class Worker(WorkerBase):
         if blocks_to_copy.numel() > 0:
             self.cache_engine.copy(blocks_to_copy)
 
+    def prepare_swap_blocks(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor,
+               torch.Tensor, List[SequenceGroupMetadata], int]:
+        assert execute_model_req is not None
+        seq_group_metadata_list = execute_model_req.seq_group_metadata_list
+        assert seq_group_metadata_list is not None
+        assert execute_model_req is not None
+        num_seq_groups = len(seq_group_metadata_list)
+        # `blocks_to_swap_in` and `blocks_to_swap_out` are cpu tensors.
+        # they contain parameters to launch cudamemcpyasync.
+        blocks_to_swap_in = torch.tensor(
+            execute_model_req.blocks_to_swap_in,
+            device="cpu",
+            dtype=torch.int64).view(-1, 2)
+        blocks_to_swap_out = torch.tensor(
+            execute_model_req.blocks_to_swap_out,
+            device="cpu",
+            dtype=torch.int64).view(-1, 2)
+        # `blocks_to_copy` is a gpu tensor. The src and tgt of
+        # blocks to copy are in the same device, and `blocks_to_copy`
+        # can be used directly within cuda kernels.
+        blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
+                                    device=self.device,
+                                    dtype=torch.int64).view(-1, 2)
+        return (blocks_to_swap_in, blocks_to_swap_out,
+                blocks_to_copy, seq_group_metadata_list, num_seq_groups)
+
     @torch.inference_mode()
     def execute_model(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> List[Union[SamplerOutput, PoolerOutput]]:
 
-        if execute_model_req is None:
-            seq_group_metadata_list = None
-        else:
-            seq_group_metadata_list = execute_model_req.seq_group_metadata_list
+        seq_group_metadata_list = None
 
         blocks_to_swap_in: torch.Tensor
         blocks_to_swap_out: torch.Tensor
         blocks_to_copy: torch.Tensor
         if self.is_driver_worker:
-            assert seq_group_metadata_list is not None
-            assert execute_model_req is not None
-            num_seq_groups = len(seq_group_metadata_list)
-            # `blocks_to_swap_in` and `blocks_to_swap_out` are cpu tensors.
-            # they contain parameters to launch cudamemcpyasync.
-            blocks_to_swap_in = torch.tensor(
-                execute_model_req.blocks_to_swap_in,
-                device="cpu",
-                dtype=torch.int64).view(-1, 2)
-            blocks_to_swap_out = torch.tensor(
-                execute_model_req.blocks_to_swap_out,
-                device="cpu",
-                dtype=torch.int64).view(-1, 2)
-            # `blocks_to_copy` is a gpu tensor. The src and tgt of
-            # blocks to copy are in the same device, and `blocks_to_copy`
-            # can be used directly within cuda kernels.
-            blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
-                                          device=self.device,
-                                          dtype=torch.int64).view(-1, 2)
+            (
+                blocks_to_swap_in,
+                blocks_to_swap_out,
+                blocks_to_copy,
+                seq_group_metadata_list,
+                num_seq_groups
+
+            ) = self.prepare_swap_blocks(execute_model_req)
             data: Dict[str, Any] = {
                 "num_seq_groups": num_seq_groups,
                 "blocks_to_swap_in": blocks_to_swap_in,
